@@ -1,7 +1,11 @@
 services:
   - type: web
-    name: viagogo-clone
-    runtime: python
+    name: viagogo-proxy
+    env: python
+    region: oregon
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 60
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
