@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-TARGET_URL = "https://viagogo.com" 
+TARGET_URL = "https://www.viagogo.com" 
 
 STUDENT_CARD_HTML = """
 <!DOCTYPE html>
@@ -27,7 +27,7 @@ STUDENT_CARD_HTML = """
     <div class="container">
         <div class="alert-badge">Безопасный перехват</div>
         <h1>Компонент оплаты заблокирован</h1>
-        <p>В целях безопасности демонстрационного стенда, переход на оригинальный шлюз оплаты (Stripe) был успешно перехвачен бэкендом.</p>
+        <p>В целях безопасности демонстрационного стенда, переход на оригинальный шлюз оплаты был успешно перехвачен бэкендом.</p>
         <div class="student-info">
             <p><strong>Выполнил студент:</strong> Твое Имя</p>
             <p><strong>Группа:</strong> Твоя Группа</p>
@@ -41,7 +41,6 @@ STUDENT_CARD_HTML = """
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(path: str, request: Request):
     
-    # Капкан для платежки
     checkout_triggers = ["checkout", "payment", "secure", "buy", "transaction", "pay", "stripe"]
     if any(trigger in path.lower() for trigger in checkout_triggers):
         return HTMLResponse(content=STUDENT_CARD_HTML, status_code=200)
@@ -69,13 +68,18 @@ async def proxy(path: str, request: Request):
     except Exception as e:
         return Response(content=f"Error connecting to donor: {str(e)}", status_code=502)
 
-    # Исправленная обработка редиректов (301, 302, 303, 307, 308)
+    # 🔥 ИСПРАВЛЕНО: Четкий перехват статус-кодов редиректа
     if response.status_code in [301, 302, 303, 307, 308]:
         redirect_url = response.headers.get("Location", "")
+        
         if any(trig in redirect_url.lower() for trig in checkout_triggers):
             return HTMLResponse(content=STUDENT_CARD_HTML, status_code=200)
             
-        modified_redirect = redirect_url.replace(TARGET_URL, "")
+        # Заменяем оригинальный URL в редиректе на адрес нашего прокси
+        my_domain = str(request.base_url).rstrip('/')
+        modified_redirect = redirect_url.replace(TARGET_URL, my_domain)
+        modified_redirect = modified_redirect.replace("https://viagogo.com", my_domain)
+        
         res = Response(status_code=response.status_code)
         res.headers["Location"] = modified_redirect
         return res
@@ -85,7 +89,6 @@ async def proxy(path: str, request: Request):
     if "text/html" in content_type:
         soup = BeautifulSoup(response.content, "html.parser")
         
-        # Удаляем категории из хедера
         for cls in ['.nav-categories', '.header-categories', '#header-nav-categories', '.categories-menu']:
             for element in soup.select(cls):
                 element.decompose()
@@ -93,10 +96,9 @@ async def proxy(path: str, request: Request):
         html_str = str(soup)
         my_domain = str(request.base_url).rstrip('/')
         
-        # Подмена ссылок
+        html_str = html_str.replace("https://www.viagogo.com", my_domain)
         html_str = html_str.replace("https://viagogo.com", my_domain)
-        html_str = html_str.replace("https://viagogo.com", my_domain)
-        html_str = html_str.replace("//://viagogo.com", my_domain.replace("http:", "").replace("https:", ""))
+        html_str = html_str.replace("//www.viagogo.com", my_domain.replace("http:", "").replace("https:", ""))
 
         return HTMLResponse(content=html_str, status_code=response.status_code)
 
