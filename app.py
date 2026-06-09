@@ -261,25 +261,15 @@ def proxy(path=''):
     print(f"[RESPONSE] Status: {resp.status_code}, Location: {resp.headers.get('Location', 'none')}")
 
     # Обработка HTTP-редиректов (30x)
-    if resp.status_code in (301, 302, 303, 307, 308):
+    if resp.status_code in (301, 302, 303, 307, 308, 202):
         location = resp.headers.get('Location', '')
         if location:
-            original_location = location
             location = replace_all_domains(location)
-            # Если Location указывает на наш домен, возвращаем редирект
-            if EXTERNAL_HOST in location:
-                print(f"[REDIRECT] Modified: {original_location} -> {location}")
-                response = flask_redirect(location, code=resp.status_code)
-            else:
-                # Если Location всё ещё внешний, заменяем принудительно
+            if EXTERNAL_HOST not in location:
                 location = f"https://{EXTERNAL_HOST}/"
-                print(f"[REDIRECT] Forced to home: {original_location} -> {location}")
-                response = flask_redirect(location, code=302)
-        else:
-            location = f"https://{EXTERNAL_HOST}/"
-            response = flask_redirect(location, code=302)
-        return response
-
+            print(f"[REDIRECT] -> {location}")
+            return flask_redirect(location, code=302 if resp.status_code == 202 else resp.status_code)
+        return flask_redirect(f"https://{EXTERNAL_HOST}/", code=302)
     content_type = resp.headers.get('Content-Type', '')
     content = resp.content
 
